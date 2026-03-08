@@ -15,20 +15,76 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fraude.document_analyzer import analyze_document, analyze_all_documents
 from fraude.rules import calculate_global_fraud_score
 
-# ── Charger le modèle ML ──────────────────────────────
-MODEL_PATH    = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'scoring', 'model', 'lead_scoring_model.pkl'
-)
-FEATURES_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'scoring', 'model', 'features.pkl'
-)
+# ── Chemins modèle ────────────────────────────────────
+BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH    = os.path.join(BASE_DIR, 'scoring', 'model', 'lead_scoring_model.pkl')
+FEATURES_PATH = os.path.join(BASE_DIR, 'scoring', 'model', 'features.pkl')
 
-model    = joblib.load(MODEL_PATH)
-features = joblib.load(FEATURES_PATH)
+# ── Lazy loading ──────────────────────────────────────
+model    = None
+features = None
 
-print("Modèle ML chargé ✅")
+def get_model():
+    global model, features
+    if model is None:
+        print("Entraînement du modèle ML...")
+        import sys
+        sys.path.append('/app')
+        
+        import pandas as pd
+        import numpy as np
+        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import Pipeline
+        
+        # Charger dataset
+        dataset_path = os.path.join(BASE_DIR, 'scoring', 'leads_dataset.csv')
+        df = pd.read_csv(dataset_path)
+        
+        # Feature Engineering
+        df['budget_x_docs']    = df['budget_normalized'].fillna(0.4) * df['docs_score']
+        df['profile_x_docs']   = df['profile_complete'] / 100 * df['docs_score']
+        df['city_x_budget']    = df['city_score'] * df['budget_normalized'].fillna(0.4)
+        df['engagement_score'] = (
+            df['has_email'] * 0.3 +
+            df['has_phone'] * 0.3 +
+            df['has_address'] * 0.2 +
+            df['is_business_hour'] * 0.2
+        )
+        
+        from sklearn.preprocessing import LabelEncoder
+        le = LabelEncoder()
+        df['listing_type_encoded'] = le.fit_transform(df['listing_type'])
+        
+        features = [
+            'listing_type_encoded', 'city_score', 'has_city',
+            'budget_normalized', 'has_budget', 'has_email',
+            'has_phone', 'has_address', 'profile_complete',
+            'docs_uploaded', 'docs_score', 'is_long_term',
+            'has_move_in_date', 'is_business_hour', 'fifo_score',
+            'budget_x_docs', 'profile_x_docs', 'city_x_budget',
+            'engagement_score'
+        ]
+        
+        X = df[features]
+        y = df['converted']
+        
+        pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('model', GradientBoostingClassifier(
+                n_estimators  = 300,
+                max_depth     = 5,
+                learning_rate = 0.05,
+                subsample     = 0.8,
+                random_state  = 42
+            ))
+        ])
+        
+        pipeline.fit(X, y)
+        model = pipeline
+        print("Modèle ML entraîné ✅")
+    
+    return model, features
 
 # ── FastAPI App ───────────────────────────────────────
 app = FastAPI(
@@ -44,6 +100,11 @@ app.add_middleware(
     allow_methods     = ["*"],
     allow_headers     = ["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    print("API démarrée ✅")
+    get_model()
 
 # ── Schéma Lead ───────────────────────────────────────
 class LeadData(BaseModel):
@@ -160,6 +221,7 @@ def health():
 @app.post("/score-lead")
 def score_lead(lead: LeadData):
     try:
+        model, features = get_model()
         X     = prepare_features(lead)
         proba = model.predict_proba(X)[0][1]
         score = round(proba * 100)
