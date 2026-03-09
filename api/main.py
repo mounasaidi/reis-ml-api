@@ -384,3 +384,34 @@ async def analyze_lead_complete(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+class DocumentBase64Request(BaseModel):
+    file_base64  : str
+    file_name    : str
+    expected_type: Optional[str] = None
+
+@app.post("/analyze-document-base64")
+async def analyze_doc_base64(request: DocumentBase64Request):
+    try:
+        import base64 as b64
+        
+        # Décoder le base64
+        file_data = b64.b64decode(request.file_base64)
+        
+        # Sauvegarder temporairement
+        suffix = os.path.splitext(request.file_name)[1] or ".pdf"
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=suffix
+        ) as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+
+        # Analyser avec la même fonction qu'avant ✅
+        result = analyze_document(tmp_path, request.expected_type)
+
+        # Nettoyer
+        os.unlink(tmp_path)
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
