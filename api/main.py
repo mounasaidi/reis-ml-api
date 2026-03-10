@@ -9,6 +9,21 @@ import tempfile
 import os
 import sys
 
+import pickle
+import pandas as pd
+
+# ── Chargement modèles conversion ────────────────────
+with open('prediction-convertion/model/model_buy.pkl', 'rb') as f:
+    model_buy = pickle.load(f)
+with open('prediction-convertion/model/model_rent.pkl', 'rb') as f:
+    model_rent = pickle.load(f)
+with open('prediction-convertion/model/features_buy.pkl', 'rb') as f:
+    features_buy = pickle.load(f)
+with open('prediction-convertion/model/features_rent.pkl', 'rb') as f:
+    features_rent = pickle.load(f)
+with open('prediction-convertion/model/emp_map.pkl', 'rb') as f:
+    emp_map = pickle.load(f)
+
 # ── Ajouter le path parent ────────────────────────────
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -614,6 +629,57 @@ async def analyze_documents_only(
             'doc_score'  : avg_score,
             'fraud_count': fraud_count,
             'doc_details': doc_results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ConversionPredictRequest(BaseModel):
+    application_type  : str
+    ai_score          : float = 0
+    doc_status        : str   = 'legitimate'
+    fifo_rank         : int   = 1
+    employment_status : str   = ''
+    has_guarantor     : int   = 0
+
+@app.post("/predict-conversion")
+async def predict_conversion(request: ConversionPredictRequest):
+    try:
+        doc_status_map = {'legitimate': 2, 'suspicious': 1, 'fraud': 0}
+        doc_encoded    = doc_status_map.get(request.doc_status, 0)
+
+        if request.application_type == 'Buy':
+            features = pd.DataFrame([{
+                'ai_score'          : request.ai_score,
+                'doc_status_encoded': doc_encoded,
+                'fifo_rank'         : request.fifo_rank
+            }])[features_buy]
+            proba = model_buy.predict_proba(features)[0][1]
+
+        else:  # Rent
+            emp_encoded = emp_map.get(request.employment_status, 0)
+            features = pd.DataFrame([{
+                'ai_score'          : request.ai_score,
+                'doc_status_encoded': doc_encoded,
+                'employment_encoded': emp_encoded,
+                'has_guarantor'     : request.has_guarantor,
+                'fifo_rank'         : request.fifo_rank
+            }])[features_rent]
+            proba = model_rent.predict_proba(features)[0][1]
+
+        probability = round(float(proba) * 100, 2)
+
+        return {
+            'application_type'      : request.application_type,
+            'conversion_probability': probability,
+            'is_likely_converted'   : probability >= 50,
+            'recommendation'        : (
+                '✅ Lead très probable à convertir'
+                if probability >= 70
+                else '⚠️ Lead modérément probable'
+                if probability >= 40
+                else '❌ Lead peu probable à convertir'
+            )
         }
 
     except Exception as e:
