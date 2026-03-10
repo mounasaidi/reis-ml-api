@@ -273,13 +273,6 @@ def validate_document(text, doc_type):
 def analyze_document(file_path, expected_type=None):
     """
     Analyser un document complet
-    
-    Paramètres :
-    → file_path     : chemin du fichier PDF/image
-    → expected_type : type attendu (optionnel)
-    
-    Retourne :
-    → dict avec résultat complet
     """
     print(f"\nAnalyse : {os.path.basename(file_path)}")
     print("-" * 40)
@@ -334,22 +327,33 @@ def analyze_document(file_path, expected_type=None):
     result['score'] = val_score
 
     # ── Verdict final ─────────────────────────────────
-    # Pénalité si mauvais type
+    # ✅ Type mismatch = fraud direct
     if expected_type and not result['type_match']:
-        result['score'] = max(result['score'] - 30, 0)
+        result['status']         = 'fraud'
+        result['fraud_detected'] = True
+        result['score']          = 0
+        result['issues'].append(
+            f"Document invalide : attendu {expected_type}, "
+            f"reçu {detected_type}"
+        )
+        result['recommendation'] = (
+            f"❌ Mauvais document fourni — "
+            f"attendu {expected_type}, reçu {detected_type}"
+        )
+        return result
 
     if result['score'] >= 70:
-        result['status']          = 'legitimate'
-        result['fraud_detected']  = False
-        result['recommendation']  = '✅ Document valide'
+        result['status']         = 'legitimate'
+        result['fraud_detected'] = False
+        result['recommendation'] = '✅ Document valide'
     elif result['score'] >= 40:
-        result['status']          = 'suspicious'
-        result['fraud_detected']  = False
-        result['recommendation']  = '⚠️ Document suspect — vérification manuelle'
+        result['status']         = 'suspicious'
+        result['fraud_detected'] = False
+        result['recommendation'] = '⚠️ Document suspect — vérification manuelle'
     else:
-        result['status']          = 'fraud'
-        result['fraud_detected']  = True
-        result['recommendation']  = '❌ Document rejeté — fraude probable'
+        result['status']         = 'fraud'
+        result['fraud_detected'] = True
+        result['recommendation'] = '❌ Document rejeté — fraude probable'
 
     print(f"Score         : {result['score']}/100")
     print(f"Statut        : {result['status']}")
