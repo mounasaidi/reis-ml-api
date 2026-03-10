@@ -684,3 +684,118 @@ async def predict_conversion(request: ConversionPredictRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+class ScoreAndPredictRequest(BaseModel):
+    application_type  : str
+    ai_score          : float = 0
+    doc_status        : str   = 'legitimate'
+    fifo_rank         : int   = 1
+    employment_status : str   = ''
+    has_guarantor     : int   = 0
+    documents         : List[DocumentBase64Item] = []
+
+@app.post("/score-and-predict")
+async def score_and_predict(request: ScoreAndPredictRequest):
+    try:
+        import base64 as b64
+
+        # ── 1. Analyse documents ──────────────────────
+        fraud_count      = 0
+        suspicious_count = 0
+        total_score      = 0
+        doc_results      = []
+
+        for doc in request.documents:
+            try:
+                file_data = b64.b64decode(doc.file_base64)
+                suffix    = os.path.splitext(doc.file_name)[1] or '.pdf'
+
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=suffix
+                ) as tmp:
+                    tmp.write(file_data)
+                    tmp_path = tmp.name
+
+                result    = analyze_document(tmp_path, doc.expected_type)
+                os.unlink(tmp_path)
+
+                doc_status = result.get('status', 'legitimate')
+                doc_score  = result.get('score', 50)
+                total_score += doc_score
+
+                if doc_status == 'fraud':
+                    fraud_count += 1
+                elif doc_status == 'suspicious':
+                    suspicious_count += 1
+
+                doc_results.append({
+                    'file_name': doc.file_name,
+                    'status'   : doc_status,
+                    'score'    : doc_score,
+                    'issues'   : result.get('issues', [])
+                })
+
+            except Exception as e:
+                doc_results.append({
+                    'file_name': doc.file_name,
+                    'status'   : 'error',
+                    'score'    : 0,
+                    'issues'   : [str(e)]
+                })
+
+        global_doc_status = 'legitimate'
+        if fraud_count > 0:
+            global_doc_status = 'fraud'
+        elif suspicious_count > 0:
+            global_doc_status = 'suspicious'
+        elif not doc_results:
+            global_doc_status = request.doc_status
+
+        avg_doc_score = (
+            int(total_score / len(doc_results))
+            if doc_results else 0
+        )
+
+        # ── 2. Prediction conversion ──────────────────
+        doc_status_map = {'legitimate': 2, 'suspicious': 1, 'fraud': 0}
+        doc_encoded    = doc_status_map.get(global_doc_status, 0)
+
+        if request.application_type == 'Buy':
+            features = pd.DataFrame([{
+                'ai_score'          : request.ai_score,
+                'doc_status_encoded': doc_encoded,
+                'fifo_rank'         : request.fifo_rank
+            }])[features_buy]
+            proba = model_buy.predict_proba(features)[0][1]
+
+        else:  # Rent
+            emp_encoded = emp_map.get(request.employment_status, 0)
+            features = pd.DataFrame([{
+                'ai_score'          : request.ai_score,
+                'doc_status_encoded': doc_encoded,
+                'employment_encoded': emp_encoded,
+                'has_guarantor'     : request.has_guarantor,
+                'fifo_rank'         : request.fifo_rank
+            }])[features_rent]
+            proba = model_rent.predict_proba(features)[0][1]
+
+        probability = round(float(proba) * 100, 2)
+
+        return {
+            'doc_status'            : global_doc_status,
+            'doc_score'             : avg_doc_score,
+            'fraud_count'           : fraud_count,
+            'doc_details'           : doc_results,
+            'conversion_probability': probability,
+            'is_likely_converted'   : probability >= 50,
+            'recommendation'        : (
+                '✅ Lead très probable à convertir'
+                if probability >= 70
+                else '⚠️ Lead modérément probable'
+                if probability >= 40
+                else '❌ Lead peu probable à convertir'
+            )
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
