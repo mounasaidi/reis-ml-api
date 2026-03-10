@@ -543,3 +543,78 @@ async def score_and_analyze(request: ScoreAndAnalyzeRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AnalyzeDocumentsOnlyRequest(BaseModel):
+    documents: List[DocumentBase64Item]
+
+@app.post("/analyze-documents-only")
+async def analyze_documents_only(
+    request: AnalyzeDocumentsOnlyRequest
+):
+    try:
+        import base64 as b64
+
+        fraud_count      = 0
+        suspicious_count = 0
+        total_score      = 0
+        doc_results      = []
+
+        for doc in request.documents:
+            try:
+                file_data = b64.b64decode(doc.file_base64)
+                suffix    = os.path.splitext(doc.file_name)[1] or '.pdf'
+
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=suffix
+                ) as tmp:
+                    tmp.write(file_data)
+                    tmp_path = tmp.name
+
+                result     = analyze_document(tmp_path, doc.expected_type)
+                os.unlink(tmp_path)
+
+                doc_status = result.get('status', 'legitimate')
+                doc_score  = result.get('score', 50)
+                total_score += doc_score
+
+                if doc_status == 'fraud':
+                    fraud_count += 1
+                elif doc_status == 'suspicious':
+                    suspicious_count += 1
+
+                doc_results.append({
+                    'file_name': doc.file_name,
+                    'status'   : doc_status,
+                    'score'    : doc_score,
+                    'issues'   : result.get('issues', [])
+                })
+
+            except Exception as e:
+                doc_results.append({
+                    'file_name': doc.file_name,
+                    'status'   : 'error',
+                    'score'    : 0,
+                    'issues'   : [str(e)]
+                })
+
+        global_status = 'legitimate'
+        if fraud_count > 0:
+            global_status = 'fraud'
+        elif suspicious_count > 0:
+            global_status = 'suspicious'
+
+        avg_score = (
+            int(total_score / len(doc_results))
+            if doc_results else 0
+        )
+
+        return {
+            'doc_status' : global_status,
+            'doc_score'  : avg_score,
+            'fraud_count': fraud_count,
+            'doc_details': doc_results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
