@@ -45,16 +45,16 @@ def get_model():
         print("Entraînement du modèle ML...")
         import sys
         sys.path.append('/app')
-        
+
         import pandas as pd
         import numpy as np
         from sklearn.ensemble import GradientBoostingClassifier
         from sklearn.impute import SimpleImputer
         from sklearn.pipeline import Pipeline
-        
+
         dataset_path = os.path.join(BASE_DIR, 'scoring', 'leads_dataset.csv')
         df = pd.read_csv(dataset_path)
-        
+
         df['budget_x_docs']    = df['budget_normalized'].fillna(0.4) * df['docs_score']
         df['profile_x_docs']   = df['profile_complete'] / 100 * df['docs_score']
         df['city_x_budget']    = df['city_score'] * df['budget_normalized'].fillna(0.4)
@@ -64,11 +64,11 @@ def get_model():
             df['has_address'] * 0.2 +
             df['is_business_hour'] * 0.2
         )
-        
+
         from sklearn.preprocessing import LabelEncoder
         le = LabelEncoder()
         df['listing_type_encoded'] = le.fit_transform(df['listing_type'])
-        
+
         features = [
             'listing_type_encoded', 'city_score', 'has_city',
             'budget_normalized', 'has_budget', 'has_email',
@@ -78,10 +78,10 @@ def get_model():
             'budget_x_docs', 'profile_x_docs', 'city_x_budget',
             'engagement_score'
         ]
-        
+
         X = df[features]
         y = df['converted']
-        
+
         pipeline = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
             ('model', GradientBoostingClassifier(
@@ -92,11 +92,11 @@ def get_model():
                 random_state  = 42
             ))
         ])
-        
+
         pipeline.fit(X, y)
         model = pipeline
         print("Modèle ML entraîné ✅")
-    
+
     return model, features
 
 # ── FastAPI App ───────────────────────────────────────
@@ -153,7 +153,6 @@ class DocumentBase64Request(BaseModel):
 
 # ── Schéma Score And Analyze ──────────────────────────
 class ScoreAndAnalyzeRequest(BaseModel):
-    # Champs scoring
     listing_type      : str
     city              : Optional[str]  = None
     has_city          : Optional[int]  = 0
@@ -169,7 +168,6 @@ class ScoreAndAnalyzeRequest(BaseModel):
     has_move_in_date  : Optional[int]  = 0
     is_business_hour  : Optional[int]  = 0
     fifo_position     : Optional[int]  = 50
-    # Champs documents
     documents         : Optional[List[DocumentBase64Item]] = None
 
 # ── Villes connues ────────────────────────────────────
@@ -180,6 +178,15 @@ CITY_SCORES = {
     'hammamet' : 0.82, 'la marsa'  : 0.95,
     'ariana'   : 0.88, 'ben arous' : 0.83,
 }
+
+# ── Encodage doc_status → (doc_status_encoded, doc_fraud_flag) ──
+DOC_STATUS_MAP = {'legitimate': 2, 'suspicious': 1, 'fraud': 0}
+
+def encode_doc_status(doc_status: str):
+    """Retourne (doc_status_encoded, doc_fraud_flag)"""
+    doc_encoded    = DOC_STATUS_MAP.get(doc_status, 0)
+    doc_fraud_flag = 1 if doc_status == 'fraud' else 0
+    return doc_encoded, doc_fraud_flag
 
 def prepare_features(lead: LeadData):
     city_score = lead.city_score
@@ -319,98 +326,6 @@ async def analyze_doc(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Endpoint Complet (Score + Fraude) ─────────────────
-@app.post("/analyze-lead")
-async def analyze_lead_complete(
-    listing_type    : str              = Form(...),
-    city            : Optional[str]    = Form(None),
-    budget          : Optional[float]  = Form(None),
-    has_email       : Optional[int]    = Form(0),
-    has_phone       : Optional[int]    = Form(0),
-    has_address     : Optional[int]    = Form(0),
-    profile_complete: Optional[float]  = Form(0),
-    is_business_hour: Optional[int]    = Form(0),
-    fifo_position   : Optional[int]    = Form(50),
-    is_long_term    : Optional[int]    = Form(None),
-    files           : list[UploadFile] = File(default=[]),
-    file_types      : Optional[str]    = Form(None)
-):
-    try:
-        docs_uploaded = len(files)
-        docs_score    = docs_uploaded / 5.0
-
-        lead = LeadData(
-            listing_type     = listing_type,
-            city             = city,
-            has_city         = 1 if city else 0,
-            budget           = budget,
-            has_budget       = 1 if budget else 0,
-            has_email        = has_email,
-            has_phone        = has_phone,
-            has_address      = has_address,
-            profile_complete = profile_complete,
-            docs_uploaded    = docs_uploaded,
-            docs_score       = docs_score,
-            is_long_term     = is_long_term,
-            has_move_in_date = 1 if is_long_term is not None else 0,
-            is_business_hour = is_business_hour,
-            fifo_position    = fifo_position
-        )
-
-        X     = prepare_features(lead)
-        proba = model.predict_proba(X)[0][1]
-        score = round(proba * 100)
-
-        if score >= 75:
-            category = "Hot"
-            emoji    = "🔥"
-        elif score >= 50:
-            category = "Warm"
-            emoji    = "🌡️"
-        else:
-            category = "Cold"
-            emoji    = "❄️"
-
-        doc_results = []
-        types_list  = file_types.split(',') if file_types else []
-
-        for i, file in enumerate(files):
-            suffix   = os.path.splitext(file.filename)[1]
-            exp_type = types_list[i] if i < len(types_list) else None
-
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=suffix
-            ) as tmp:
-                content = await file.read()
-                tmp.write(content)
-                tmp_path = tmp.name
-
-            result = analyze_document(tmp_path, exp_type)
-            doc_results.append(result)
-            os.unlink(tmp_path)
-
-        fraud_score = calculate_global_fraud_score(doc_results)
-        fraud_count = sum(1 for r in doc_results if r['fraud_detected'])
-
-        return {
-            "lead_score"     : score,
-            "category"       : category,
-            "emoji"          : emoji,
-            "probability"    : round(float(proba), 4),
-            "fraud_score"    : fraud_score,
-            "fraud_detected" : fraud_count > 0,
-            "fraud_count"    : fraud_count,
-            "documents"      : doc_results,
-            "summary"        : (
-                f"Score: {score}/100 {emoji} | "
-                f"Documents: {len(doc_results) - fraud_count}/"
-                f"{len(doc_results)} valides"
-            )
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # ── Endpoint Document Base64 ──────────────────────────
 @app.post("/analyze-document-base64")
 async def analyze_doc_base64(request: DocumentBase64Request):
@@ -432,13 +347,12 @@ async def analyze_doc_base64(request: DocumentBase64Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Endpoint Score + Analyze en un seul appel ─────────
+# ── Endpoint Score + Analyze (ancien) ─────────────────
 @app.post("/score-and-analyze")
 async def score_and_analyze(request: ScoreAndAnalyzeRequest):
     try:
         import base64 as b64
 
-        # ── 1. Scoring ────────────────────────────────
         model, features = get_model()
 
         lead = LeadData(
@@ -483,11 +397,10 @@ async def score_and_analyze(request: ScoreAndAnalyzeRequest):
         ])
         reliability = round(100 - (missing * 15))
 
-        # ── 2. Analyse documents ──────────────────────
-        doc_results     = []
-        fraud_count     = 0
-        suspicious_count= 0
-        total_doc_score = 0
+        doc_results      = []
+        fraud_count      = 0
+        suspicious_count = 0
+        total_doc_score  = 0
 
         if request.documents:
             for doc in request.documents:
@@ -506,7 +419,6 @@ async def score_and_analyze(request: ScoreAndAnalyzeRequest):
 
                     doc_status = result.get('status', 'legitimate')
                     doc_score  = result.get('score', 50)
-
                     total_doc_score += doc_score
 
                     if doc_status == 'fraud':
@@ -540,16 +452,13 @@ async def score_and_analyze(request: ScoreAndAnalyzeRequest):
             if doc_results else 0
         )
 
-        # ── 3. Résultat combiné ───────────────────────
         return {
-            # Scoring
             "score"      : score,
             "category"   : category,
             "emoji"      : emoji,
             "probability": round(float(proba), 4),
             "reliability": reliability,
             "priority"   : priority,
-            # Documents
             "doc_status" : global_doc_status,
             "doc_score"  : avg_doc_score,
             "fraud_count": fraud_count,
@@ -564,9 +473,7 @@ class AnalyzeDocumentsOnlyRequest(BaseModel):
     documents: List[DocumentBase64Item]
 
 @app.post("/analyze-documents-only")
-async def analyze_documents_only(
-    request: AnalyzeDocumentsOnlyRequest
-):
+async def analyze_documents_only(request: AnalyzeDocumentsOnlyRequest):
     try:
         import base64 as b64
 
@@ -634,6 +541,8 @@ async def analyze_documents_only(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Schéma Predict Conversion ─────────────────────────
 class ConversionPredictRequest(BaseModel):
     application_type  : str
     ai_score          : float = 0
@@ -645,27 +554,29 @@ class ConversionPredictRequest(BaseModel):
 @app.post("/predict-conversion")
 async def predict_conversion(request: ConversionPredictRequest):
     try:
-        doc_status_map = {'legitimate': 2, 'suspicious': 1, 'fraud': 0}
-        doc_encoded    = doc_status_map.get(request.doc_status, 0)
+        # ── Encodage avec doc_fraud_flag ─────────────
+        doc_encoded, doc_fraud_flag = encode_doc_status(request.doc_status)
 
         if request.application_type == 'Buy':
-            features = pd.DataFrame([{
-                'ai_score'          : request.ai_score,
+            X = pd.DataFrame([{
+                'doc_fraud_flag'    : doc_fraud_flag,
                 'doc_status_encoded': doc_encoded,
-                'fifo_rank'         : request.fifo_rank
+                'ai_score'          : request.ai_score,
+                'fifo_rank'         : request.fifo_rank,
             }])[features_buy]
-            proba = model_buy.predict_proba(features)[0][1]
+            proba = model_buy.predict_proba(X)[0][1]
 
         else:  # Rent
             emp_encoded = emp_map.get(request.employment_status, 0)
-            features = pd.DataFrame([{
-                'ai_score'          : request.ai_score,
+            X = pd.DataFrame([{
+                'doc_fraud_flag'    : doc_fraud_flag,
                 'doc_status_encoded': doc_encoded,
+                'ai_score'          : request.ai_score,
                 'employment_encoded': emp_encoded,
                 'has_guarantor'     : request.has_guarantor,
-                'fifo_rank'         : request.fifo_rank
+                'fifo_rank'         : request.fifo_rank,
             }])[features_rent]
-            proba = model_rent.predict_proba(features)[0][1]
+            proba = model_rent.predict_proba(X)[0][1]
 
         probability = round(float(proba) * 100, 2)
 
@@ -684,7 +595,9 @@ async def predict_conversion(request: ConversionPredictRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
+# ── Schéma Score And Predict ──────────────────────────
 class ScoreAndPredictRequest(BaseModel):
     application_type  : str
     ai_score          : float = 0
@@ -716,7 +629,7 @@ async def score_and_predict(request: ScoreAndPredictRequest):
                     tmp.write(file_data)
                     tmp_path = tmp.name
 
-                result    = analyze_document(tmp_path, doc.expected_type)
+                result     = analyze_document(tmp_path, doc.expected_type)
                 os.unlink(tmp_path)
 
                 doc_status = result.get('status', 'legitimate')
@@ -743,12 +656,15 @@ async def score_and_predict(request: ScoreAndPredictRequest):
                     'issues'   : [str(e)]
                 })
 
-        global_doc_status = 'legitimate'
+        # ── Statut global documents ───────────────────
         if fraud_count > 0:
             global_doc_status = 'fraud'
         elif suspicious_count > 0:
             global_doc_status = 'suspicious'
-        elif not doc_results:
+        elif doc_results:
+            global_doc_status = 'legitimate'
+        else:
+            # Pas de documents → utiliser le statut envoyé par Salesforce
             global_doc_status = request.doc_status
 
         avg_doc_score = (
@@ -756,28 +672,29 @@ async def score_and_predict(request: ScoreAndPredictRequest):
             if doc_results else 0
         )
 
-        # ── 2. Prediction conversion ──────────────────
-        doc_status_map = {'legitimate': 2, 'suspicious': 1, 'fraud': 0}
-        doc_encoded    = doc_status_map.get(global_doc_status, 0)
+        # ── 2. Prédiction conversion avec doc_fraud_flag ──
+        doc_encoded, doc_fraud_flag = encode_doc_status(global_doc_status)
 
         if request.application_type == 'Buy':
-            features = pd.DataFrame([{
-                'ai_score'          : request.ai_score,
+            X = pd.DataFrame([{
+                'doc_fraud_flag'    : doc_fraud_flag,
                 'doc_status_encoded': doc_encoded,
-                'fifo_rank'         : request.fifo_rank
+                'ai_score'          : request.ai_score,
+                'fifo_rank'         : request.fifo_rank,
             }])[features_buy]
-            proba = model_buy.predict_proba(features)[0][1]
+            proba = model_buy.predict_proba(X)[0][1]
 
         else:  # Rent
             emp_encoded = emp_map.get(request.employment_status, 0)
-            features = pd.DataFrame([{
-                'ai_score'          : request.ai_score,
+            X = pd.DataFrame([{
+                'doc_fraud_flag'    : doc_fraud_flag,
                 'doc_status_encoded': doc_encoded,
+                'ai_score'          : request.ai_score,
                 'employment_encoded': emp_encoded,
                 'has_guarantor'     : request.has_guarantor,
-                'fifo_rank'         : request.fifo_rank
+                'fifo_rank'         : request.fifo_rank,
             }])[features_rent]
-            proba = model_rent.predict_proba(features)[0][1]
+            proba = model_rent.predict_proba(X)[0][1]
 
         probability = round(float(proba) * 100, 2)
 
